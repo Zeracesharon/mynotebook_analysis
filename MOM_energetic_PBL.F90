@@ -509,9 +509,10 @@ subroutine energetic_PBL(h_3d, u_3d, v_3d, tv, fluxes, visc, dt, Kd_int, G, GV, 
   real :: mstar_used_shear, mstar_used_shear_tmp1, mstar_used_shear_tmp2     ! 用 0/1 标记（real 或 integer 都行）
   real :: zsum, ml_cap
   integer ::  Kint
-  real, allocatable, save :: d2_mstar_e(:,:), d2_mstar_s(:,:)
+  real, allocatable, save :: diag_mstar_ePBL(:,:), diag_mstar_shear(:,:)
   logical, save :: diag_alloc = .false.
-  real, allocatable, save :: d2_Me(:,:), d2_Conv(:,:), d2_Ee(:,:), d2_Es(:,:), d2_Hbl(:,:), d2_flag(:,:)
+  real, allocatable, save :: diag_OSBL_Me_KS(:,:), diag_OSBL_Conv_KS(:,:)
+  real, allocatable, save :: diag_E_ePBL(:,:), diag_E_shear(:,:), diag_Hbl(:,:), diag_used_shear_flag(:,:)
 
 
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec ; nz = GV%ke
@@ -561,8 +562,9 @@ subroutine energetic_PBL(h_3d, u_3d, v_3d, tv, fluxes, visc, dt, Kd_int, G, GV, 
     diag_alloc = .true.
   endif
   ! zero before filling this timestep
-  d2_Me   = 0.0 ; d2_Conv = 0.0 ; d2_Ee = 0.0 ; d2_Es = 0.0 ; d2_Hbl = 0.0 ; d2_flag = 0.0  
-  d2_mstar_e = 0.0 ; d2_mstar_s = 0.0
+  diag_OSBL_Me_KS = 0.0 ; diag_OSBL_Conv_KS = 0.0 ; diag_E_ePBL = 0.0 ; diag_E_shear = 0.0 ; diag_Hbl = 0.0 ;
+  diag_used_shear_flag = 0.0  
+  diag_mstar_ePBL = 0.0 ; diag_mstar_shear = 0.0
 
   if (CS%debug .or. (CS%id_Mixing_Length>0)) diag_Mixing_Length(:,:,:) = 0.0
   if (CS%debug .or. (CS%id_Velocity_Scale>0)) diag_Velocity_Scale(:,:,:) = 0.0
@@ -705,7 +707,7 @@ subroutine energetic_PBL(h_3d, u_3d, v_3d, tv, fluxes, visc, dt, Kd_int, G, GV, 
       have_KS = associated(visc%Kd_shear)          ! KAPPA_SHEAR 是否激活（指针已关联）
       if (want_energy_coupling .and. .not. have_KS) then
         if (CS%warn_if_no_kappa_shear .and. .not. warned_noKS) then
-          if (mdl%is_master) call MOM_mesg(NOTE, "EPBL shear-energy coupling enabled but KAPPA_SHEAR is not active; using default mstar.")
+          call MOM_mesg(NOTE, "EPBL shear-energy coupling enabled but KAPPA_SHEAR is not active; using default mstar.")
           warned_noKS = .true.
         endif
       endif
@@ -1369,7 +1371,14 @@ subroutine ePBL_column(h, dz, u, v, T0, S0, dSV_dT, dSV_dS, SpV_dt, TKE_forcing,
          if (present(use_shear_energy) .and. use_shear_energy .and. &
              present(Me_shear_in)      .and. present(Conv_shear_in)) then !compare energy and chose the maximum
                E_shear= max(0.0, -Me_shear_in - CS%nstar * Conv_shear_in)
-               if (present(mstar_shear_out))  mstar_shear_out = E_shear / u3 
+               if (present(mstar_shear_out)) then
+                    if (u3 > tiny(1.0)) then
+                        mstar_shear_out = E_shear / u3
+                    else
+                        mstar_shear_out = 0.0
+                    end if
+               end if
+                       mstar_shear_out = E_shear / u3 
                if (E_shear > E_ePBL_local) then
                     mstar_total = E_shear / u3
                     if (present(mstar_used_shear)) mstar_used_shear = 1.0
@@ -1394,7 +1403,7 @@ subroutine ePBL_column(h, dz, u, v, T0, S0, dSV_dT, dSV_dS, SpV_dt, TKE_forcing,
              endif
              if (lt_scale > 1.0) then
                  call mstar_Langmuir(CS, US, absf, B_flux, u_star, MLD_guess, La, &
-                                     mstar_total, mstar_LT, LAmod, LT_rescale_factor=lt_scale)
+                                     mstar_total, mstar_LT, LAmod, Rescale_LT=lt_scale)
              else
                  call mstar_Langmuir(CS, US, absf, B_flux, u_star, MLD_guess, La, &
                                      mstar_total, mstar_LT, LAmod)
@@ -4179,7 +4188,7 @@ subroutine energetic_PBL_init(Time, G, GV, US, param_file, diag, CS)
   if (CS%mstar_scheme == Use_Fixed_MStar) then
     if (CS%use_shear_energy_coupling) then
       CS%use_shear_energy_coupling = .false.
-      if (mdl%is_master) call MOM_mesg(NOTE, &
+      call MOM_mesg(NOTE, &
         "EPBL_USE_SHEAR_ENERGY_COUPLING is ignored because EPBL_MSTAR_SCHEME=CONSTANT (fixed m*).")
     endif
   endif

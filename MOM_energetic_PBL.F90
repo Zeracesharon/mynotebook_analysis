@@ -317,6 +317,15 @@ type, public :: ePBL_column_diags ; private
   real :: mstar_LT  !< The portion of mstar due to Langmuir turbulence [nondim]
   integer :: OBL_its !< The number of iterations used to find a self-consistent surface boundary layer depth
   integer :: BBL_its !< The number of iterations used to find a self-consistent bottom boundary layer depth
+  real :: OSBL_Me_KS       !< entrainment PE from kappa–shear (negative w′b′ integral) [m^3 s^-3]
+  real :: OSBL_Conv_KS     !< convective buoyancy work from kappa–shear (positive part) [m^3 s^-3]
+  real :: E_ePBL           !< baseline mechanical energy m* u*^3 from ePBL [m^3 s^-3]
+  real :: E_shear          !< mechanical energy implied by shear (-Me - n*Conv) [m^3 s^-3]
+  real :: Hbl_est          !< mixed-layer depth estimate by max|dθ/dz| [m]
+  real :: used_shear_flag  !< 1 if shear energy chosen this column, else 0
+  real :: mstar_ePBL       !< m* computed by ePBL before energy selection [nondim]
+  real :: mstar_shear      !< m* implied by shear energy [nondim]
+
 end type ePBL_column_diags
 
 contains
@@ -477,6 +486,15 @@ subroutine energetic_PBL(h_3d, u_3d, v_3d, tv, fluxes, visc, dt, Kd_int, G, GV, 
     diag_LA, &         ! Langmuir number [nondim]
     diag_LA_MOD        ! Modified Langmuir number [nondim]
 
+  real, dimension(SZI_(G),SZJ_(G)) :: &
+    diag_OSBL_Me_KS,        &  ! [R Z3 T-3 ~> W m-2]
+    diag_OSBL_Conv_KS,      &  ! [R Z3 T-3 ~> W m-2]
+    diag_E_ePBL,            &  ! [R Z3 T-3 ~> W m-2]
+    diag_E_shear,           &  ! [R Z3 T-3 ~> W m-2]
+    diag_Hbl_est,           &  ! [Z ~> m]
+    diag_used_shear_flag,   &  ! [1]
+    diag_mstar_ePBL,        &  ! [1]
+    diag_mstar_shear           ! [1]
   ! The following variables are only used for diagnosing sensitivities to ePBL settings
   real, dimension(SZK_(GV)+1) :: &
     Kd_1, Kd_2      ! Diapycnal diffusivities found with different ePBL options [H Z T-1 ~> m2 s-1 or kg m-1 s-1]
@@ -505,14 +523,9 @@ subroutine energetic_PBL(h_3d, u_3d, v_3d, tv, fluxes, visc, dt, Kd_int, G, GV, 
   !local variables for shear energy and ePBL coupling
   logical :: want_energy_coupling, have_KS
   logical, save :: warned_noKS = .false.       ! 仅提醒一次
-  real :: Me_shear, Conv_shear, Hbl_est, E_ePBL_col, mstar_e_col, mstar_shear_col
-  real :: mstar_used_shear, mstar_used_shear_tmp1, mstar_used_shear_tmp2     ! 用 0/1 标记（real 或 integer 都行）
+  real :: Me_shear, Conv_shear, Hbl_est
   real :: zsum, ml_cap
   integer ::  Kint
-  real, allocatable, save :: diag_mstar_ePBL(:,:), diag_mstar_shear(:,:)
-  logical, save :: diag_alloc = .false.
-  real, allocatable, save :: diag_OSBL_Me_KS(:,:), diag_OSBL_Conv_KS(:,:)
-  real, allocatable, save :: diag_E_ePBL(:,:), diag_E_shear(:,:), diag_Hbl(:,:), diag_used_shear_flag(:,:)
 
 
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec ; nz = GV%ke
@@ -554,17 +567,14 @@ subroutine energetic_PBL(h_3d, u_3d, v_3d, tv, fluxes, visc, dt, Kd_int, G, GV, 
       enddo ; enddo
     endif
   endif
-
-  if (.not. diag_alloc) then
-    allocate( diag_OSBL_Me_KS(is:ie,js:je), diag_OSBL_Conv_KS(is:ie,js:je), diag_E_ePBL(is:ie,js:je), &
-              diag_E_shear(is:ie,js:je), diag_Hbl(is:ie,js:je),  diag_used_shear_flag(is:ie,js:je), &
-             diag_mstar_ePBL(is:ie,js:je), diag_mstar_shear(is:ie,js:je)  )
-    diag_alloc = .true.
-  endif
+  
   ! zero before filling this timestep
-  diag_OSBL_Me_KS = 0.0 ; diag_OSBL_Conv_KS = 0.0 ; diag_E_ePBL = 0.0 ; diag_E_shear = 0.0 ; diag_Hbl = 0.0 ;
-  diag_used_shear_flag = 0.0  
-  diag_mstar_ePBL = 0.0 ; diag_mstar_shear = 0.0
+  if (CS%use_shear_energy_coupling .and. associated(visc%Kd_shear)) then
+      diag_OSBL_Me_KS = 0.0 ; diag_OSBL_Conv_KS = 0.0 ; diag_E_ePBL = 0.0 ; 
+      diag_E_shear = 0.0 ; diag_Hbl_est = 0.0 ;
+      diag_used_shear_flag = 0.0  
+      diag_mstar_ePBL = 0.0 ; diag_mstar_shear = 0.0
+  endif
 
   if (CS%debug .or. (CS%id_Mixing_Length>0)) diag_Mixing_Length(:,:,:) = 0.0
   if (CS%debug .or. (CS%id_Velocity_Scale>0)) diag_Velocity_Scale(:,:,:) = 0.0
@@ -702,12 +712,12 @@ subroutine energetic_PBL(h_3d, u_3d, v_3d, tv, fluxes, visc, dt, Kd_int, G, GV, 
       else
         do K=1,nz+1 ; SpV_dt_cf(K) = SpV_dt(K) ; enddo
       endif
-
+      ! --- shear-energy coupling availability ---
       want_energy_coupling = CS%use_shear_energy_coupling
-      have_KS = associated(visc%Kd_shear)          ! KAPPA_SHEAR 是否激活（指针已关联）
+      have_KS = associated(visc%Kd_shear)          
       if (want_energy_coupling .and. .not. have_KS) then
         if (CS%warn_if_no_kappa_shear .and. .not. warned_noKS) then
-          call MOM_mesg(NOTE, "EPBL shear-energy coupling enabled but KAPPA_SHEAR is not active; using default mstar.")
+          call MOM_mesg('EPBL shear-energy coupling enabled but KAPPA_SHEAR is not active; using default mstar.',0)
           warned_noKS = .true.
         endif
       endif
@@ -717,57 +727,36 @@ subroutine energetic_PBL(h_3d, u_3d, v_3d, tv, fluxes, visc, dt, Kd_int, G, GV, 
       else
         Me_shear   = 0.0
         Conv_shear = 0.0
-        mstar_used_shear = 0.0
         Hbl_est = 0.0
       endif      
       if (stoch_CS%pert_epbl) then ! stochastics are active
-        if (want_energy_coupling .and. have_KS) then ! kappa shear energy coupling is active
             call ePBL_column(h, dz, u, v, T0, S0, dSV_dT_1d, dSV_dS_1d, SpV_dt_cf, TKE_forcing, B_flux, absf, &
                              u_star, u_star_mean, mech_TKE, dt, MLD_io, Kd, mixvel, mixlen, GV, &
                              US, CS, eCD, Waves, G, i, j, &
                              TKE_gen_stoch=stoch_CS%epbl1_wts(i,j), TKE_diss_stoch=stoch_CS%epbl2_wts(i,j),&
-                             use_shear_energy=.true., Me_shear_in=Me_shear, Conv_shear_in=Conv_shear, &
-                             mstar_used_shear=mstar_used_shear, &
-                             E_ePBL_out=E_ePBL_col, mstar_ePBL_out=mstar_e_col, mstar_shear_out=mstar_shear_col)
-            diag_mstar_ePBL(i,j) = mstar_e_col
-            diag_mstar_shear(i,j) = mstar_shear_col
-            diag_OSBL_Me_KS(i,j)   = Me_shear
-            diag_OSBL_Conv_KS(i,j) = Conv_shear
-            diag_E_ePBL(i,j)   = E_ePBL_col
-            diag_E_shear(i,j)   = -Me_shear - CS%nstar*Conv_shear
-            diag_Hbl(i,j)  = Hbl_est
-            diag_used_shear_flag(i,j) = merge(1.0, 0.0, mstar_used_shear==1.0)
-        else 
-            call ePBL_column(h, dz, u, v, T0, S0, dSV_dT_1d, dSV_dS_1d, SpV_dt_cf, TKE_forcing, B_flux, absf, &
-                             u_star, u_star_mean, mech_TKE, dt, MLD_io, Kd, mixvel, mixlen, GV, &
-                             US, CS, eCD, Waves, G, i, j, &
-                             TKE_gen_stoch=stoch_CS%epbl1_wts(i,j), TKE_diss_stoch=stoch_CS%epbl2_wts(i,j))
-        endif
+                             use_shear_energy=(want_energy_coupling .and. have_KS), &
+                             Me_shear_in=Me_shear, Conv_shear_in=Conv_shear)
       else
-        if (want_energy_coupling .and. have_KS) then ! kappa shear energy coupling is active
             call ePBL_column(h, dz, u, v, T0, S0, dSV_dT_1d, dSV_dS_1d, SpV_dt_cf, TKE_forcing, B_flux, absf, &
                              u_star, u_star_mean, mech_TKE, dt, MLD_io, Kd, mixvel, mixlen, GV, &
                              US, CS, eCD, Waves, G, i, j, &
-                             use_shear_energy=.true., Me_shear_in=Me_shear, Conv_shear_in=Conv_shear, &
-                             mstar_used_shear=mstar_used_shear, &
-                             E_ePBL_out=E_ePBL_col, mstar_ePBL_out=mstar_e_col, mstar_shear_out=mstar_shear_col) 
-            diag_mstar_ePBL(i,j) = mstar_e_col
-            diag_mstar_shear(i,j) = mstar_shear_col
-            diag_OSBL_Me_KS(i,j)   = Me_shear
-            diag_OSBL_Conv_KS(i,j) = Conv_shear
-            diag_E_ePBL(i,j)   = E_ePBL_col
-            diag_E_shear(i,j)   = -Me_shear - CS%nstar*Conv_shear
-            diag_Hbl(i,j)  = Hbl_est
-            diag_used_shear_flag(i,j) = merge(1.0, 0.0, mstar_used_shear==1.0)
-        else       
-            call ePBL_column(h, dz, u, v, T0, S0, dSV_dT_1d, dSV_dS_1d, SpV_dt_cf, TKE_forcing, B_flux, absf, &
-                             u_star, u_star_mean, mech_TKE, dt, MLD_io, Kd, mixvel, mixlen, GV, &
-                             US, CS, eCD, Waves, G, i, j)
-        endif
+                             use_shear_energy=(want_energy_coupling .and. have_KS), &
+                             Me_shear_in=Me_shear, Conv_shear_in=Conv_shear)
       endif
-      
-      if (have_KS .and. (mstar_used_shear == 1.0)) then
-        if (CS%shutdown_shear_in_ML) then   ! shutdown shear on surface boundary layer to avoid kappa shear results overwash
+      if (CS%use_shear_energy_coupling .and. associated(visc%Kd_shear)) then
+          eCD%Hbl_est                 = Hbl_est   !roughly estimate of MLD
+          diag_mstar_ePBL(i,j)        = eCD%mstar_ePBL
+          diag_mstar_shear(i,j)       = eCD%mstar_shear
+          diag_OSBL_Me_KS(i,j)        = eCD%OSBL_Me_KS
+          diag_OSBL_Conv_KS(i,j)      = eCD%OSBL_Conv_KS
+          diag_E_ePBL(i,j)            = eCD%E_ePBL
+          diag_E_shear(i,j)           = eCD%E_shear
+          diag_Hbl_est(i,j)           = eCD%Hbl_est
+          diag_used_shear_flag(i,j)   = eCD%used_shear_flag
+      endif
+  ! --- shutdown kappa-shear inside OSBL if this column used shear energy ---
+      if (have_KS .and. CS%shutdown_shear_in_ML) then
+        if (eCD%used_shear_flag >= 0.5) then   ! 1.0=shear energy is used
           zsum = 0.0
           ml_cap = max(0.0, min(MLD_io, sum(dz)))
           do k = 1, nz
@@ -860,30 +849,18 @@ subroutine energetic_PBL(h_3d, u_3d, v_3d, tv, fluxes, visc, dt, Kd_int, G, GV, 
         if (CS%options_diff < 4) then
           BLD_1 = MLD_in ; BLD_2 = MLD_in
           do K=1,nz+1 ; SpV_dt_tmp(K) = SpV_scale1 * SpV_dt(K) ; enddo
-          if (CS_tmp1%use_shear_energy_coupling .and. have_KS) then
-              call ePBL_column(h, dz, u, v, T0, S0, dSV_dT_1d, dSV_dS_1d, SpV_dt_tmp, TKE_forcing, &
-                               B_flux, absf, u_star, u_star_mean, mech_TKE, dt, BLD_1, Kd_1, &
-                               mixvel, mixlen, GV, US, CS_tmp1, eCD_tmp, Waves, G, i, j, &
-                               use_shear_energy=.true., Me_shear_in=Me_shear, Conv_shear_in=Conv_shear, &
-                               mstar_used_shear=mstar_used_shear_tmp1)
-          else
-             call ePBL_column(h, dz, u, v, T0, S0, dSV_dT_1d, dSV_dS_1d, SpV_dt_tmp, TKE_forcing, &
-                               B_flux, absf, u_star, u_star_mean, mech_TKE, dt, BLD_1, Kd_1, &
-                               mixvel, mixlen, GV, US, CS_tmp1, eCD_tmp, Waves, G, i, j)
-          endif
-                   
+          call ePBL_column(h, dz, u, v, T0, S0, dSV_dT_1d, dSV_dS_1d, SpV_dt_tmp, TKE_forcing, &
+                           B_flux, absf, u_star, u_star_mean, mech_TKE, dt, BLD_1, Kd_1, &
+                           mixvel, mixlen, GV, US, CS_tmp1, eCD_tmp, Waves, G, i, j, &
+                           use_shear_energy=(CS_tmp1%use_shear_energy_coupling .and. have_KS),&
+                           Me_shear_in=Me_shear, Conv_shear_in=Conv_shear)
+                
           do K=1,nz+1 ; SpV_dt_tmp(K) = SpV_scale2 * SpV_dt(K) ; enddo
-          if (CS_tmp2%use_shear_energy_coupling .and. have_KS) then
-              call ePBL_column(h, dz, u, v, T0, S0, dSV_dT_1d, dSV_dS_1d, SpV_dt_tmp, TKE_forcing, &
-                               B_flux, absf, u_star, u_star_mean, mech_TKE, dt, BLD_2, Kd_2, &
-                               mixvel, mixlen, GV, US, CS_tmp2, eCD_tmp, Waves, G, i, j, &
-                               use_shear_energy=.true., Me_shear_in=Me_shear, Conv_shear_in=Conv_shear, &
-                               mstar_used_shear=mstar_used_shear_tmp2)
-          else
-              call ePBL_column(h, dz, u, v, T0, S0, dSV_dT_1d, dSV_dS_1d, SpV_dt_tmp, TKE_forcing, &
-                               B_flux, absf, u_star, u_star_mean, mech_TKE, dt, BLD_2, Kd_2, &
-                               mixvel, mixlen, GV, US, CS_tmp2, eCD_tmp, Waves, G, i, j)
-          endif
+          call ePBL_column(h, dz, u, v, T0, S0, dSV_dT_1d, dSV_dS_1d, SpV_dt_tmp, TKE_forcing, &
+                           B_flux, absf, u_star, u_star_mean, mech_TKE, dt, BLD_2, Kd_2, &
+                           mixvel, mixlen, GV, US, CS_tmp2, eCD_tmp, Waves, G, i, j, &
+                           use_shear_energy=(CS_tmp2%use_shear_energy_coupling .and. have_KS),& 
+                           Me_shear_in=Me_shear, Conv_shear_in=Conv_shear)
 
         else
           BLD_1 = BBLD_in ; BLD_2 = BBLD_in
@@ -971,10 +948,10 @@ subroutine energetic_PBL(h_3d, u_3d, v_3d, tv, fluxes, visc, dt, Kd_int, G, GV, 
   if (CS%use_shear_energy_coupling) then
     if (associated(visc%Kd_shear)) then
       if (CS%id_OSBL_Me_KS      > 0) call post_data(CS%id_OSBL_Me_KS,      diag_OSBL_Me_KS,  CS%diag)
-      if (CS%id_OSBL_Conv_KS    > 0) call post_data(CS%id_OSBL_Conv_KS,    diag_Conv_KS,CS%diag)
+      if (CS%id_OSBL_Conv_KS    > 0) call post_data(CS%id_OSBL_Conv_KS,    diag_OSBL_Conv_KS,CS%diag)
       if (CS%id_E_ePBL          > 0) call post_data(CS%id_E_ePBL,          diag_E_ePBL,  CS%diag)
       if (CS%id_E_shear         > 0) call post_data(CS%id_E_shear,         diag_E_shear,  CS%diag)
-      if (CS%id_Hbl_est         > 0) call post_data(CS%id_Hbl_est,         diag_Hbl, CS%diag)
+      if (CS%id_Hbl_est         > 0) call post_data(CS%id_Hbl_est,         diag_Hbl_est, CS%diag)
       if (CS%id_used_shear_flag > 0) call post_data(CS%id_used_shear_flag, diag_used_shear_flag,CS%diag)
       if (CS%id_mstar_ePBL      > 0) call post_data(CS%id_mstar_ePBL,      diag_mstar_ePBL,  CS%diag)
       if (CS%id_mstar_shear    > 0)  call post_data(CS%id_mstar_shear,     diag_mstar_shear,CS%diag)
@@ -988,7 +965,8 @@ end subroutine energetic_PBL
 !!  mixed layer model for a single column of water.
 subroutine ePBL_column(h, dz, u, v, T0, S0, dSV_dT, dSV_dS, SpV_dt, TKE_forcing, B_flux, absf, &
                        u_star, u_star_mean, mech_TKE_in, dt, MLD_io, Kd, mixvel, mixlen, GV, US, CS, eCD, &
-                       Waves, G, i, j, TKE_gen_stoch, TKE_diss_stoch, use_shear_energy, Me_shear_in, Conv_shear_in,mstar_used_shear)
+                       Waves, G, i, j, TKE_gen_stoch, TKE_diss_stoch, &
+                       use_shear_energy, Me_shear_in, Conv_shear_in)
   type(verticalGrid_type), intent(in)    :: GV     !< The ocean's vertical grid structure.
   type(unit_scale_type),   intent(in)    :: US     !< A dimensional unit scaling type
   real, dimension(SZK_(GV)), intent(in)  :: h      !< Layer thicknesses [H ~> m or kg m-2].
@@ -1044,13 +1022,9 @@ subroutine ePBL_column(h, dz, u, v, T0, S0, dSV_dT, dSV_dS, SpV_dt, TKE_forcing,
   integer,                 intent(in)    :: j      !< The j-index to work on (used for Waves)
   real,          optional, intent(in)    :: TKE_gen_stoch  !< random factor used to perturb TKE generation [nondim]
   real,          optional, intent(in)    :: TKE_diss_stoch !< random factor used to perturb TKE dissipation [nondim]
-! 新增可选输入与输出（列值标量）
+! kappa shear energy coupling
   logical, optional, intent(in)  :: use_shear_energy
   real,    optional, intent(in)  :: Me_shear_in, Conv_shear_in
-  real,    optional, intent(inout) :: mstar_used_shear   ! 本列是否最终采用 shear 能量（0/1）
-  real,    optional, intent(out) :: E_ePBL_out   !< baseline ePBL energy (no LT) [m^3 s^-3]
-  real,    optional, intent(out) :: mstar_ePBL_out  !< baseline m* (no LT)
-  real,    optional, intent(out) :: mstar_shear_out !< shear-implied m* = E_shear/u*^3
 !    This subroutine determines the diffusivities in a single column from the integrated energetics
 !  planetary boundary layer (ePBL) model.  It assumes that heating, cooling and freshwater fluxes
 !  have already been applied.  All calculations are done implicitly, and there
@@ -1266,7 +1240,7 @@ subroutine ePBL_column(h, dz, u, v, T0, S0, dSV_dT, dSV_dS, SpV_dt, TKE_forcing,
   ! variables for ML based diffusivity
   real :: v0_ML_turb_vel_scale ! turbulence vel scale from ML in diffusivity [Z T-1 ~> m s-1]
   ! local variables for shear energy coupling
-  real :: E_ePBL, E_shear, u3, mstar_e_local, E_ePBL_local
+  real :: E_shear, u3, mstar_e_local, E_ePBL_local
   real :: lt_scale, E_used, denom !where LT will be rescaled based on energy         
   nz = GV%ke
 
@@ -1361,35 +1335,39 @@ subroutine ePBL_column(h, dz, u, v, T0, S0, dSV_dT, dSV_dS, SpV_dt, TKE_forcing,
           else
             call find_mstar(CS, US, B_flux, u_star, MLD_guess, absf, mstar_total)
           endif
-         if (present(mstar_used_shear)) mstar_used_shear = 0.0
+          eCD%used_shear_flag = 0.0
     else
          call find_mstar(CS, US, B_flux, u_star, MLD_guess, absf, mstar_e_local)
          u3     = max(u_star**3, tiny(1.0)) 
          E_ePBL_local  = max(0.0, mstar_e_local * u3)     
-         if (present(E_ePBL_out))     E_ePBL_out     = E_ePBL_local
-         if (present(mstar_ePBL_out)) mstar_ePBL_out = mstar_e_local
+         E_shear        = 0.0
+
+         eCD%mstar_ePBL  = mstar_e_local      ! [nondim]
+         eCD%E_ePBL      = E_ePBL_local       ! [m^3 s^-3]
+         
          if (present(use_shear_energy) .and. use_shear_energy .and. &
              present(Me_shear_in)      .and. present(Conv_shear_in)) then !compare energy and chose the maximum
-               E_shear= max(0.0, -Me_shear_in - CS%nstar * Conv_shear_in)
-               if (present(mstar_shear_out)) then
-                    if (u3 > tiny(1.0)) then
-                        mstar_shear_out = E_shear / u3
-                    else
-                        mstar_shear_out = 0.0
-                    end if
-               end if
-                       mstar_shear_out = E_shear / u3 
-               if (E_shear > E_ePBL_local) then
-                    mstar_total = E_shear / u3
-                    if (present(mstar_used_shear)) mstar_used_shear = 1.0
-               else
-                    mstar_total = mstar_e_local
-                    if (present(mstar_used_shear)) mstar_used_shear = 0.0
-               endif
+
+             eCD%OSBL_Me_KS   = Me_shear_in         ! ≤ 0, [m^3 s^-3]
+             eCD%OSBL_Conv_KS = Conv_shear_in       ! ≥ 0, [m^3 s^-3]
+             E_shear= max(0.0, -Me_shear_in - CS%nstar * Conv_shear_in)
+             eCD%E_shear      = E_shear              ! [m^3 s^-3]
+             eCD%mstar_shear  = E_shear / u3   
+
+             if (E_shear > E_ePBL_local) then
+                 mstar_total            = eCD%mstar_shear
+                 eCD%used_shear_flag    = 1.0
+             else
+                  mstar_total = mstar_e_local
+                  eCD%used_shear_flag    = 0.0
+             endif
          else
            mstar_total = mstar_e_local
-           if (present(mstar_used_shear)) mstar_used_shear = 0.0
-           if (present(mstar_shear_out)) mstar_shear_out = 0.0  
+           eCD%OSBL_Me_KS        = 0.0
+           eCD%OSBL_Conv_KS      = 0.0
+           eCD%E_shear           = 0.0
+           eCD%mstar_shear       = 0.0
+           eCD%used_shear_flag   = 0.0
          endif
        !Calculate mstar_LT based on mstar_total that has been potential replaced by shear energy 
          if (CS%Use_LT) then
@@ -3793,7 +3771,7 @@ subroutine compute_shear_energy_1col(T0, S0, dSV_dT, dSV_dS, dz, Kd_shear_col, &
 
   !local variables
   integer :: nz        !< Number of layers in the column (= size(dz))
-  integer :: k, K      !< Layer (k) and interface (K=k+1) indices
+  integer :: k, K_1      !< Layer (k) and interface (K=k+1) indices
   integer :: k_H       !< Layer index of max |dθ/dz| (for Hbl_est)
   real    :: g         !< Gravity in model units [Z T^-2 ~> m s^-2]
   real    :: dbdT      !< ∂b/∂T at an interface [Z T^-2 C^-1 ~> m s^-2 degC^-1]
@@ -3817,8 +3795,8 @@ subroutine compute_shear_energy_1col(T0, S0, dSV_dT, dSV_dS, dz, Kd_shear_col, &
   enddo
   dTdz(nz)   = dTdz(nz-1)
   dTdz_zi(1) = dTdz(1)
-  do K=2,nz
-    dTdz_zi(K) = 0.5*(dTdz(K-1)+dTdz(K))
+  do K_1=2,nz
+    dTdz_zi(K_1) = 0.5*(dTdz(K_1-1)+dTdz(K_1))
   enddo
   dTdz_zi(nz+1) = dTdz(nz)
 
@@ -3834,26 +3812,26 @@ subroutine compute_shear_energy_1col(T0, S0, dSV_dT, dSV_dS, dz, Kd_shear_col, &
 
   ! 3) N^2 and interface w′b′ from shear diffusion
   N2(:)     = 0.0 ; Bshear(:) = 0.0
-  do K=2,nz
-    k       = K
+  do K_1=2,nz
+    k       = K_1
     dz_int  = 0.5*(dz(k-1)+dz(k))
     I_dz_int= 1.0/dz_int
     dbdT    = g * GV%Rho0 * 0.5*(dSV_dT(k-1)+dSV_dT(k))
     dbdS    = g * GV%Rho0 * 0.5*(dSV_dS(k-1)+dSV_dS(k))
     dT      = (T0(k-1)-T0(k))
     dS      = (S0(k-1)-S0(k))
-    N2(K)   = max(0.0, I_dz_int * (dbdT*dT + dbdS*dS))
-    Bshear(K) = - N2(K) * Kd_shear_col(K)
+    N2(K_1)   = max(0.0, I_dz_int * (dbdT*dT + dbdS*dS))
+    Bshear(K_1) = - N2(K_1) * Kd_shear_col(K_1)
   enddo
   Bshear(1)    = 0.0
   Bshear(nz+1) = 0.0
 
   ! 4)  Integrate only within the OSBL (0 to Hbl_est)
   Me_shear   = 0.0 ; Conv_shear = 0.0 ; zsum = 0.0
-  do k=1,nz
+  do k=1,nz-1
     if (zsum >= Hbl_est) exit
-    K = k+1
-    contrib = 0.5*(Bshear(K)+Bshear(K+1)) * dz(k)
+    K_1 = k+1
+    contrib = 0.5*(Bshear(K_1)+Bshear(K_1+1)) * dz(k)
     if (contrib < 0.0) then
       Me_shear   = Me_shear   + contrib
     else
@@ -4008,7 +3986,8 @@ subroutine energetic_PBL_init(Time, G, GV, US, param_file, diag, CS)
                      ! bottom boundary layer mixing is not enabled.
   logical :: use_la_windsea
   real :: c_m3s3_to_Wm2 ! conversion from m^3 s^-3  →  W m^-2
-
+  character(len=32) :: gamma_str !for MOM-message string convert
+  
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
 
   CS%initialized = .true.
@@ -4180,7 +4159,7 @@ subroutine energetic_PBL_init(Time, G, GV, US, param_file, diag, CS)
                  default=.false., do_not_log=(CS%mstar_scheme==Use_Fixed_MStar))
   call get_param(param_file, mdl, "EPBL_SHEAR_ENERGY_SHUTDOWN_ML", CS%shutdown_shear_in_ML, &
                  "If true and shear energy dominates, zero Kd_shear within the diagnosed mixed layer depth.", &
-                 default=.true., do_not_log=(CS%mstar_scheme==Use_Fixed_MStar))
+                 default=.false., do_not_log=(CS%mstar_scheme==Use_Fixed_MStar))
   call get_param(param_file, mdl, "EPBL_SHEAR_ENERGY_WARN_IF_NO_KS", CS%warn_if_no_kappa_shear, &
                  "Warn when energy coupling is enabled but KAPPA_SHEAR is off; fallback to default m*.", &
                  default=.true., do_not_log=(CS%mstar_scheme==Use_Fixed_MStar))
@@ -4188,8 +4167,7 @@ subroutine energetic_PBL_init(Time, G, GV, US, param_file, diag, CS)
   if (CS%mstar_scheme == Use_Fixed_MStar) then
     if (CS%use_shear_energy_coupling) then
       CS%use_shear_energy_coupling = .false.
-      call MOM_mesg(NOTE, &
-        "EPBL_USE_SHEAR_ENERGY_COUPLING is ignored because EPBL_MSTAR_SCHEME=CONSTANT (fixed m*).")
+      call MOM_mesg('EPBL_USE_SHEAR_ENERGY_COUPLING is ignored because EPBL_MSTAR_SCHEME=CONSTANT (fixed m*).',0)
     endif
   endif
 
@@ -4472,10 +4450,11 @@ subroutine energetic_PBL_init(Time, G, GV, US, param_file, diag, CS)
                  "If true, mildly up-scales Convective Langmuir Number by (E_used/E_ePBL)^gamma.", &
                  default=.false.,do_not_log=(.not. (CS%Use_LT .and. CS%use_shear_energy_coupling)))
   call get_param(param_file, mdl, "EPBL_LT_RESCALE_GAMMA", CS%LT_rescale_gamma, &
-                 "Exponent gamma for CLN rescale (0.2–0.5 recommended).", &
-                 units="nondim", default=0.3,do_not_log=((CS%Use_LT .and. CS%use_shear_energy_coupling)))
+                 "Exponent gamma for mstar_LT rescale when shear energy are used(0.2–0.5 recommended).", &
+                 units="nondim", default=0.3,do_not_log=(.not. (CS%Use_LT .and. CS%use_shear_energy_coupling)))
   if (CS%LT_rescale_by_shear .and. (CS%LT_rescale_gamma < 0.2 .or. CS%LT_rescale_gamma > 0.5)) then
-     call MOM_mesg(NOTE, "EPBL_LT_RESCALE_GAMMA outside 0.2–0.5; using value "//trim(num_to_str(CS%LT_rescale_gamma)))
+     write(gamma_str,'(F6.3)') CS%LT_rescale_gamma
+     call MOM_mesg('EPBL_LT_RESCALE_GAMMA outside 0.2-0.5; using value"'//trim(gamma_str)//'"',0)
   endif
   CS%LT_rescale_gamma = max(0.0, min(CS%LT_rescale_gamma, 1.0))
   !/Options related to Machine Learning Equation Discovery
@@ -4648,26 +4627,24 @@ subroutine energetic_PBL_init(Time, G, GV, US, param_file, diag, CS)
   endif
   if (CS%use_shear_energy_coupling .and. kappa_shear_is_used(param_file)) then
     c_m3s3_to_Wm2 = GV%H_to_kg_m2 * US%Z_to_m**2 * US%s_to_T**3
-    if (CS%id_OSBL_Me_KS < 0) then
-      CS%id_mstar_ePBL = register_diag_field('ocean_model','mstar_ePBL',diag%axesT1,Time, &
-        'Baseline m* from ePBL (no Langmuir)', '1')
-      CS%id_mstar_shear = register_diag_field('ocean_model','mstar_shear',diag%axesT1,Time, &
-        'Shear-implied m* = E_shear / u*^3', '1')
-      CS%id_OSBL_Me_KS = register_diag_field('ocean_model','OSBL_Me_KS',diag%axesT1,Time, &
-        'OSBL entrainment PE conversion from kappa-shear (negative w''b'' integral)', 'W m-2', &
-        conversion=c_m3s3_to_Wm2)
-      CS%id_OSBL_Conv_KS = register_diag_field('ocean_model','OSBL_Conv_KS',diag%axesT1,Time, &
-        'OSBL convective buoyancy work from kappa-shear (positive w''b'' integral)', 'W m-2', &
-        conversion=c_m3s3_to_Wm2)
-      CS%id_E_ePBL = register_diag_field('ocean_model','E_ePBL',diag%axesT1,Time, &
-        'Mechanical energy from ePBL baseline (m* u*^3)', 'W m-2', conversion=c_m3s3_to_Wm2)
-      CS%id_E_shear = register_diag_field('ocean_model','E_shear',diag%axesT1,Time, &
-        'Mechanical energy implied by shear (-Me - n*Conv)', 'W m-2', conversion=c_m3s3_to_Wm2)
-      CS%id_Hbl_est = register_diag_field('ocean_model','Hbl_est',diag%axesT1,Time, &
-        'Mixed-layer depth estimate by max|dθ/dz|', 'm', conversion=US%Z_to_m)
-      CS%id_used_shear_flag = register_diag_field('ocean_model','used_shear_flag',diag%axesT1,Time, &
-        'Whether shear energy dominated this column (1=yes,0=no)', '1')
-    endif
+    CS%id_mstar_ePBL = register_diag_field('ocean_model','mstar_ePBL',diag%axesT1,Time, &
+      'Baseline m* from ePBL (no Langmuir)', '1')
+    CS%id_mstar_shear = register_diag_field('ocean_model','mstar_shear',diag%axesT1,Time, &
+      'Shear-implied m* = E_shear / u*^3', '1')
+    CS%id_OSBL_Me_KS = register_diag_field('ocean_model','OSBL_Me_KS',diag%axesT1,Time, &
+      'OSBL entrainment PE conversion from kappa-shear (negative w''b'' integral)', 'W m-2', &
+      conversion=c_m3s3_to_Wm2)
+    CS%id_OSBL_Conv_KS = register_diag_field('ocean_model','OSBL_Conv_KS',diag%axesT1,Time, &
+      'OSBL convective buoyancy work from kappa-shear (positive w''b'' integral)', 'W m-2', &
+      conversion=c_m3s3_to_Wm2)
+    CS%id_E_ePBL = register_diag_field('ocean_model','E_ePBL',diag%axesT1,Time, &
+      'Mechanical energy from ePBL baseline (m* u*^3)', 'W m-2', conversion=c_m3s3_to_Wm2)
+    CS%id_E_shear = register_diag_field('ocean_model','E_shear',diag%axesT1,Time, &
+      'Mechanical energy implied by shear (-Me - n*Conv)', 'W m-2', conversion=c_m3s3_to_Wm2)
+    CS%id_Hbl_est = register_diag_field('ocean_model','Hbl_est',diag%axesT1,Time, &
+      'Mixed-layer depth estimate by max|dθ/dz|', 'm', conversion=US%Z_to_m)
+    CS%id_used_shear_flag = register_diag_field('ocean_model','used_shear_flag',diag%axesT1,Time, &
+      'Whether shear energy dominated this column (1=yes,0=no)', '1')
   endif
   if (CS%options_diff > 0) then
     CS%id_opt_diff_Kd_ePBL = register_diag_field('ocean_model', 'ePBL_opt_diff_Kd_ePBL', diag%axesTi, &

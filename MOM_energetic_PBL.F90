@@ -116,6 +116,8 @@ type, public :: energetic_PBL_CS ; private
   logical :: warn_if_no_kappa_shear    = .true.   ! ePBL 开启耦合而 kappa_shear 未开时给提示
   logical :: LT_rescale_by_shear = .false.   ! EPBL_LT_RESCALE_BY_SHEAR
   real    :: LT_rescale_gamma    = 0.3       ! EPBL_LT_RESCALE_GAMMA (recommended 0.2–0.5)
+  logical :: IS_KS_weight            =.false.  !weighted function apply to Kd_interface profile
+  real    :: W_ratio            =0.8          !ratio top layer keeps unsmoothed, unchanged
   !/ vertical decay related options
   real    :: TKE_decay       !< The ratio of the natural Ekman depth to the TKE decay scale [nondim].
 
@@ -271,7 +273,7 @@ type, public :: energetic_PBL_CS ; private
   integer :: id_ustar_BBL = -1, id_BBL_decay_scale = -1, id_BBL_depth = -1
   integer :: id_MSTAR_mix = -1, id_LA_mod = -1, id_LA = -1, id_MSTAR_LT = -1
   integer :: id_OSBL_Me_KS = -1, id_OSBL_Conv_KS = -1, id_E_ePBL = -1, id_E_shear = -1
-  integer :: id_Hbl_est = -1, id_used_shear_flag = -1
+  integer :: id_Hbl_est = -1,   id_used_shear_flag = -1
   integer :: id_mstar_ePBL = -1, id_mstar_shear = -1
   ! The next options are used when passively diagnosing sensitivities from parameter choices
   integer :: id_opt_diff_Kd_ePBL = -1, id_opt_maxdiff_Kd_ePBL = -1, id_opt_diff_hML_depth = -1
@@ -335,7 +337,7 @@ contains
 !!  have already been applied.  All calculations are done implicitly, and there
 !!  is no stability limit on the time step.
 subroutine energetic_PBL(h_3d, u_3d, v_3d, tv, fluxes, visc, dt, Kd_int, G, GV, US, CS, &
-                         stoch_CS, dSV_dT, dSV_dS, TKE_forced, buoy_flux, Waves )
+                         stoch_CS, dSV_dT, dSV_dS, TKE_forced, buoy_flux, Waves, KS_cap_m_out,IS_KS_weight,W_ratio)
   type(ocean_grid_type),   intent(inout) :: G      !< The ocean's grid structure.
   type(verticalGrid_type), intent(in)    :: GV     !< The ocean's vertical grid structure.
   type(unit_scale_type),   intent(in)    :: US     !< A dimensional unit scaling type
@@ -375,8 +377,10 @@ subroutine energetic_PBL(h_3d, u_3d, v_3d, tv, fluxes, visc, dt, Kd_int, G, GV, 
                            intent(in)    :: buoy_flux !< The surface buoyancy flux [Z2 T-3 ~> m2 s-3].
   type(wave_parameters_CS), pointer      :: Waves  !< Waves control structure for Langmuir turbulence
   type(stochastic_CS),     pointer       :: stoch_CS  !< The control structure returned by a previous
-
-!    This subroutine determines the diffusivities from the integrated energetics
+  real, optional, intent(out), dimension(:,:)   :: KS_cap_m_out  !< [i,j] OSBL depth to shut down shear, 0 indicates not shutdown
+  logical, optional, intent(out) :: IS_KS_weight
+  real, optional, intent(out) :: W_ratio
+ !    This subroutine determines the diffusivities from the integrated energetics
 !  mixed layer model.  It assumes that heating, cooling and freshwater fluxes
 !  have already been applied.  All calculations are done implicitly, and there
 !  is no stability limit on the time step.
@@ -542,7 +546,7 @@ subroutine energetic_PBL(h_3d, u_3d, v_3d, tv, fluxes, visc, dt, Kd_int, G, GV, 
   if (CS%use_LT .and. .not.associated(Waves)) call MOM_error(FATAL, &
       "energetic_PBL: The Waves control structure must be associated if CS%use_LT "//&
       "(i.e., USE_LA_LI2016 or EPBL_LT) is True.")
-
+  if (present(KS_cap_m_out)) KS_cap_m_out = 0.0
 
   h_neglect = GV%H_subroundoff
   I_rho = GV%H_to_Z * GV%RZ_to_H ! == 1.0 / GV%Rho0 ! This is not used when fully non-Boussinesq.
@@ -571,7 +575,7 @@ subroutine energetic_PBL(h_3d, u_3d, v_3d, tv, fluxes, visc, dt, Kd_int, G, GV, 
   ! zero before filling this timestep
   if (CS%use_shear_energy_coupling .and. associated(visc%Kd_shear)) then
       diag_OSBL_Me_KS = 0.0 ; diag_OSBL_Conv_KS = 0.0 ; diag_E_ePBL = 0.0 ; 
-      diag_E_shear = 0.0 ; diag_Hbl_est = 0.0 ;
+      diag_E_shear = 0.0 ; diag_Hbl_est = 0.0  
       diag_used_shear_flag = 0.0  
       diag_mstar_ePBL = 0.0 ; diag_mstar_shear = 0.0
   endif
@@ -714,7 +718,9 @@ subroutine energetic_PBL(h_3d, u_3d, v_3d, tv, fluxes, visc, dt, Kd_int, G, GV, 
       endif
       ! --- shear-energy coupling availability ---
       want_energy_coupling = CS%use_shear_energy_coupling
-      have_KS = associated(visc%Kd_shear)          
+      have_KS = associated(visc%Kd_shear)         
+      IS_KS_weight=CS%IS_KS_weight
+      W_ratio=CS%W_ratio 
       if (want_energy_coupling .and. .not. have_KS) then
         if (CS%warn_if_no_kappa_shear .and. .not. warned_noKS) then
           call MOM_mesg('EPBL shear-energy coupling enabled but KAPPA_SHEAR is not active; using default mstar.',0)
@@ -723,11 +729,13 @@ subroutine energetic_PBL(h_3d, u_3d, v_3d, tv, fluxes, visc, dt, Kd_int, G, GV, 
       endif
       if (want_energy_coupling .and. have_KS) then
         call compute_shear_energy_1col( T0, S0, dSV_dT_1d, dSV_dS_1d, dz, &
-                                        visc%Kd_shear(i,j,:), Me_shear, Conv_shear, Hbl_est, GV, US )
+                                        visc%Kd_shear(i,j,:), Me_shear, Conv_shear, &
+                                        Hbl_est, GV, US )
+        eCD%Hbl_est                 = Hbl_est   !roughly estimate of MLD before rewritten by ePBL                        
       else
         Me_shear   = 0.0
         Conv_shear = 0.0
-        Hbl_est = 0.0
+        Hbl_est = 0.0;  
       endif      
       if (stoch_CS%pert_epbl) then ! stochastics are active
             call ePBL_column(h, dz, u, v, T0, S0, dSV_dT_1d, dSV_dS_1d, SpV_dt_cf, TKE_forcing, B_flux, absf, &
@@ -735,16 +743,15 @@ subroutine energetic_PBL(h_3d, u_3d, v_3d, tv, fluxes, visc, dt, Kd_int, G, GV, 
                              US, CS, eCD, Waves, G, i, j, &
                              TKE_gen_stoch=stoch_CS%epbl1_wts(i,j), TKE_diss_stoch=stoch_CS%epbl2_wts(i,j),&
                              use_shear_energy=(want_energy_coupling .and. have_KS), &
-                             Me_shear_in=Me_shear, Conv_shear_in=Conv_shear)
+                             Me_shear_in=Me_shear, Conv_shear_in=Conv_shear,Kd_shear_col=visc%Kd_shear(i,j,:))
       else
             call ePBL_column(h, dz, u, v, T0, S0, dSV_dT_1d, dSV_dS_1d, SpV_dt_cf, TKE_forcing, B_flux, absf, &
                              u_star, u_star_mean, mech_TKE, dt, MLD_io, Kd, mixvel, mixlen, GV, &
                              US, CS, eCD, Waves, G, i, j, &
                              use_shear_energy=(want_energy_coupling .and. have_KS), &
-                             Me_shear_in=Me_shear, Conv_shear_in=Conv_shear)
+                             Me_shear_in=Me_shear, Conv_shear_in=Conv_shear,Kd_shear_col=visc%Kd_shear(i,j,:))
       endif
       if (CS%use_shear_energy_coupling .and. associated(visc%Kd_shear)) then
-          eCD%Hbl_est                 = Hbl_est   !roughly estimate of MLD
           diag_mstar_ePBL(i,j)        = eCD%mstar_ePBL
           diag_mstar_shear(i,j)       = eCD%mstar_shear
           diag_OSBL_Me_KS(i,j)        = eCD%OSBL_Me_KS
@@ -754,19 +761,30 @@ subroutine energetic_PBL(h_3d, u_3d, v_3d, tv, fluxes, visc, dt, Kd_int, G, GV, 
           diag_Hbl_est(i,j)           = eCD%Hbl_est
           diag_used_shear_flag(i,j)   = eCD%used_shear_flag
       endif
-  ! --- shutdown kappa-shear inside OSBL if this column used shear energy ---
-      if (have_KS .and. CS%shutdown_shear_in_ML) then
-        if (eCD%used_shear_flag >= 0.5) then   ! 1.0=shear energy is used
-          zsum = 0.0
-          ml_cap = max(0.0, min(MLD_io, sum(dz)))
-          do k = 1, nz
-            if (zsum >= ml_cap) exit
-            Kint = k + 1
-            visc%Kd_shear(i,j,Kint) = 0.0
-            zsum = zsum + dz(k)
-          end do
-        endif
+      ml_cap = max(0.0, min(Hbl_est, sum(dz)))
+      if (present(KS_cap_m_out)) then
+          if (CS%use_shear_energy_coupling .and. CS%shutdown_shear_in_ML .and. have_KS .and. eCD%used_shear_flag >= 0.5) then
+               KS_cap_m_out(i,j) = ml_cap 
+          else
+               KS_cap_m_out(i,j) = 0.0
+          endif
       endif
+!  ! --- shutdown kappa-shear inside OSBL if this column used shear energy ---
+!      if (have_KS .and. CS%shutdown_shear_in_ML) then
+!        if (eCD%used_shear_flag >= 0.5) then   ! 1.0=shear energy is used
+!          zsum = 0.0
+!      !    ml_cap = max(0.0, min(MLD_io, sum(dz)))
+!      ! choose the depth to shut shear down ：Hml_KS（default）or  Hbl_est
+!          ml_cap = merge(Hbl_est, Hml_KS, CS%KS_use_Hbl_for_shutdown)
+!          ml_cap = max(0.0, min(ml_cap, sum(dz)))
+!          do k = 1, nz
+!            if (zsum >= ml_cap) exit
+!            Kint = k + 1
+!            visc%Kd_shear(i,j,Kint) = 0.0
+!            zsum = zsum + dz(k)
+!          end do
+!        endif
+!      endif
 
       ! Add the diffusivity due to bottom boundary layer mixing, if there is energy to drive this mixing.
       if (BBL_mixing) then
@@ -853,14 +871,14 @@ subroutine energetic_PBL(h_3d, u_3d, v_3d, tv, fluxes, visc, dt, Kd_int, G, GV, 
                            B_flux, absf, u_star, u_star_mean, mech_TKE, dt, BLD_1, Kd_1, &
                            mixvel, mixlen, GV, US, CS_tmp1, eCD_tmp, Waves, G, i, j, &
                            use_shear_energy=(CS_tmp1%use_shear_energy_coupling .and. have_KS),&
-                           Me_shear_in=Me_shear, Conv_shear_in=Conv_shear)
+                           Me_shear_in=Me_shear, Conv_shear_in=Conv_shear,Kd_shear_col=visc%Kd_shear(i,j,:))
                 
           do K=1,nz+1 ; SpV_dt_tmp(K) = SpV_scale2 * SpV_dt(K) ; enddo
           call ePBL_column(h, dz, u, v, T0, S0, dSV_dT_1d, dSV_dS_1d, SpV_dt_tmp, TKE_forcing, &
                            B_flux, absf, u_star, u_star_mean, mech_TKE, dt, BLD_2, Kd_2, &
                            mixvel, mixlen, GV, US, CS_tmp2, eCD_tmp, Waves, G, i, j, &
                            use_shear_energy=(CS_tmp2%use_shear_energy_coupling .and. have_KS),& 
-                           Me_shear_in=Me_shear, Conv_shear_in=Conv_shear)
+                           Me_shear_in=Me_shear, Conv_shear_in=Conv_shear,Kd_shear_col=visc%Kd_shear(i,j,:))
 
         else
           BLD_1 = BBLD_in ; BLD_2 = BBLD_in
@@ -966,7 +984,7 @@ end subroutine energetic_PBL
 subroutine ePBL_column(h, dz, u, v, T0, S0, dSV_dT, dSV_dS, SpV_dt, TKE_forcing, B_flux, absf, &
                        u_star, u_star_mean, mech_TKE_in, dt, MLD_io, Kd, mixvel, mixlen, GV, US, CS, eCD, &
                        Waves, G, i, j, TKE_gen_stoch, TKE_diss_stoch, &
-                       use_shear_energy, Me_shear_in, Conv_shear_in)
+                       use_shear_energy, Me_shear_in, Conv_shear_in,Kd_shear_col)
   type(verticalGrid_type), intent(in)    :: GV     !< The ocean's vertical grid structure.
   type(unit_scale_type),   intent(in)    :: US     !< A dimensional unit scaling type
   real, dimension(SZK_(GV)), intent(in)  :: h      !< Layer thicknesses [H ~> m or kg m-2].
@@ -1025,6 +1043,7 @@ subroutine ePBL_column(h, dz, u, v, T0, S0, dSV_dT, dSV_dS, SpV_dt, TKE_forcing,
 ! kappa shear energy coupling
   logical, optional, intent(in)  :: use_shear_energy
   real,    optional, intent(in)  :: Me_shear_in, Conv_shear_in
+  real, dimension(:), optional, intent(in) :: Kd_shear_col  ! size SZK_(GV)+1 (interfaces)
 !    This subroutine determines the diffusivities in a single column from the integrated energetics
 !  planetary boundary layer (ePBL) model.  It assumes that heating, cooling and freshwater fluxes
 !  have already been applied.  All calculations are done implicitly, and there
@@ -1240,7 +1259,7 @@ subroutine ePBL_column(h, dz, u, v, T0, S0, dSV_dT, dSV_dS, SpV_dt, TKE_forcing,
   ! variables for ML based diffusivity
   real :: v0_ML_turb_vel_scale ! turbulence vel scale from ML in diffusivity [Z T-1 ~> m s-1]
   ! local variables for shear energy coupling
-  real :: E_shear, u3, mstar_e_local, E_ePBL_local
+  real :: E_shear, u3, mstar_e_local, E_ePBL_local,Me_shear_loc, Conv_shear_loc,Hbl_est
   real :: lt_scale, E_used, denom !where LT will be rescaled based on energy         
   nz = GV%ke
 
@@ -1338,23 +1357,28 @@ subroutine ePBL_column(h, dz, u, v, T0, S0, dSV_dT, dSV_dS, SpV_dt, TKE_forcing,
           eCD%used_shear_flag = 0.0
     else
          call find_mstar(CS, US, B_flux, u_star, MLD_guess, absf, mstar_e_local)
-         u3     = max(u_star**3, tiny(1.0)) 
+         u3    = max(u_star**3, tiny(1.0))  
          E_ePBL_local  = max(0.0, mstar_e_local * u3)     
          E_shear        = 0.0
 
          eCD%mstar_ePBL  = mstar_e_local      ! [nondim]
          eCD%E_ePBL      = E_ePBL_local       ! [m^3 s^-3]
-         
          if (present(use_shear_energy) .and. use_shear_energy .and. &
              present(Me_shear_in)      .and. present(Conv_shear_in)) then !compare energy and chose the maximum
-
-             eCD%OSBL_Me_KS   = Me_shear_in         ! ≤ 0, [m^3 s^-3]
-             eCD%OSBL_Conv_KS = Conv_shear_in       ! ≥ 0, [m^3 s^-3]
-             E_shear= max(0.0, -Me_shear_in - CS%nstar * Conv_shear_in)
+             Me_shear_loc=Me_shear_in
+             Conv_shear_loc=Conv_shear_in
+             if (present(Kd_shear_col)) then
+                  call compute_shear_energy_1col( T0, S0, dSV_dT, dSV_dS, dz, Kd_shear_col, &
+                                  Me_shear_loc, Conv_shear_loc, Hbl_est, GV, US, MLD_in=MLD_guess)     
+                  eCD%Hbl_est = Hbl_est   !roughly estimate of MLD rewritten by MLD_guess
+             endif
+             eCD%OSBL_Me_KS   = Me_shear_loc         ! ≤ 0, [m^3 s^-3]
+             eCD%OSBL_Conv_KS = Conv_shear_loc       ! ≥ 0, [m^3 s^-3]
+             E_shear= max(0.0, -Me_shear_loc - CS%nstar * Conv_shear_loc)
              eCD%E_shear      = E_shear              ! [m^3 s^-3]
-             eCD%mstar_shear  = E_shear / u3   
+             eCD%mstar_shear  = E_shear / max(u3, tiny(1.0))   
 
-             if (E_shear > E_ePBL_local) then
+             if ((E_shear > E_ePBL_local) .and. (u3 > 1.0e-6)) then
                  mstar_total            = eCD%mstar_shear
                  eCD%used_shear_flag    = 1.0
              else
@@ -3727,7 +3751,7 @@ end subroutine Find_Mstar
 !This function calculate the Me energy for a single column from kappa shear using w'b',diapycnal buoyancy flux calculation is based on
 !MOM_diagnose_KdWork.F90 and MOM_kappa_shear.F90 
 subroutine compute_shear_energy_1col(T0, S0, dSV_dT, dSV_dS, dz, Kd_shear_col, &
-                                     Me_shear, Conv_shear, Hbl_est, GV, US)
+                                     Me_shear, Conv_shear, Hbl_est, GV, US,MLD_in)
   type(verticalGrid_type), intent(in)    :: GV     !< The ocean's vertical grid structure.
   type(unit_scale_type),   intent(in)    :: US     !< A dimensional unit scaling type
   real, dimension(SZK_(GV)), intent(in)  :: dz     !< The vertical distance across layers [Z ~> m].
@@ -3746,7 +3770,7 @@ subroutine compute_shear_energy_1col(T0, S0, dSV_dT, dSV_dS, dz, Kd_shear_col, &
   real, intent(out) :: Conv_shear !< OSBL integral of POSITIVE w′b′ (convective buoyancy work),
                                   !!  units [Z^3 T^-3 ~> m^3 s^-3]; algebraically ≥ 0.
   real, intent(out) :: Hbl_est    !< Mixed-layer depth estimate by max |dθ/dz| on zl [Z ~> m].
-  
+  real, optional, intent(in) :: MLD_in  !< mixed layer depth estimated by ePBL [m] (use ePBL_MLD if present)
 !  This subroutine compute the shear-driven buoyancy work within the surface boundary layer (OSBL) for
 !  a single water column, using interface diffusivities from the kappa_shear scheme. The algorithm for estimating
 !  the energy (OSBL-only) is similar with LES-informed Energy:
@@ -3785,10 +3809,9 @@ subroutine compute_shear_energy_1col(T0, S0, dSV_dT, dSV_dS, dz, Kd_shear_col, &
   real, allocatable :: dTdz_zi(:) !< Interpolated dθ/dz on interfaces [C Z^-1 ~> degC m^-1]
   real    :: zsum      !< Running depth from surface downward [Z ~> m]
   real    :: contrib   !< Layer-integrated contribution of w′b′ over dz(k) [Z^3 T^-3 ~> m^3 s^-3]
-
+  
   nz = size(dz) ; allocate(N2(nz+1), Bshear(nz+1), dTdz(nz), dTdz_zi(nz+1))
   g  = 9.81 * US%L_to_m / US%T_to_s**2   ! Gravity in model units (usually 9.81), in US normally L_to_m=1, T_to_s=1
-
   ! 1) Layer-centered gradient and interface interpolation of dθ/dz
   do k=1,nz-1
     dTdz(k) = (T0(k) - T0(k+1)) / dz(k+1)
@@ -3809,7 +3832,9 @@ subroutine compute_shear_energy_1col(T0, S0, dSV_dT, dSV_dS, dz, Kd_shear_col, &
   do k=1,k_H
     Hbl_est = Hbl_est + dz(k)
   enddo
-
+ if (present(MLD_in)) then
+  Hbl_est=max(0.0, min(MLD_in, sum(dz)))
+ endif
   ! 3) N^2 and interface w′b′ from shear diffusion
   N2(:)     = 0.0 ; Bshear(:) = 0.0
   do K_1=2,nz
@@ -3820,8 +3845,11 @@ subroutine compute_shear_energy_1col(T0, S0, dSV_dT, dSV_dS, dz, Kd_shear_col, &
     dbdS    = g * GV%Rho0 * 0.5*(dSV_dS(k-1)+dSV_dS(k))
     dT      = (T0(k-1)-T0(k))
     dS      = (S0(k-1)-S0(k))
-    N2(K_1)   = max(0.0, I_dz_int * (dbdT*dT + dbdS*dS))
-    Bshear(K_1) = - N2(K_1) * Kd_shear_col(K_1)
+    N2(K_1)   = I_dz_int * (dbdT*dT + dbdS*dS)
+  !  Bshear(K_1) = - N2(K_1) * Kd_shear_col(K_1)
+    Bshear(K_1) = -1 * Kd_shear_col(K_1) * &
+              ( g * ( 0.5*(dSV_dT(k-1)+dSV_dT(k)) * (T0(k-1)-T0(k))/dz_int + &
+                      0.5*(dSV_dS(k-1)+dSV_dS(k)) * (S0(k-1)-S0(k))/dz_int ) )
   enddo
   Bshear(1)    = 0.0
   Bshear(nz+1) = 0.0
@@ -3839,6 +3867,19 @@ subroutine compute_shear_energy_1col(T0, S0, dSV_dT, dSV_dS, dz, Kd_shear_col, &
     endif
     zsum = zsum + dz(k)
   enddo
+  ! --- Hml_KS：independent with ePBL calculation for last timestep, purely dependent on shear information, kappa-shear |w′b′|
+ ! Hml_KS = 0.0
+ ! if (nz >= 2) then
+ !   Bref = abs(Bshear(2))                         ! 表面下第一个界面
+ !   thr  = max(1.0e-12, KS_rel_thr * Bref)        ! 相对阈值 + 绝对下限
+ !   zsum = 0.0
+ !   do k=1,nz-1
+ !     if (abs(Bshear(k+1)) < thr) exit
+ !     Hml_KS = Hml_KS + dz(k)
+ !   end do
+ ! end if
+  Me_shear  =  GV%Rho0 * Me_shear 
+  Conv_shear = GV%Rho0 * Conv_shear
 end subroutine compute_shear_energy_1col
 
 !> This subroutine modifies the Mstar value if the Langmuir number is present
@@ -3985,7 +4026,7 @@ subroutine energetic_PBL_init(Time, G, GV, US, param_file, diag, CS)
   logical :: no_BBL  ! If true, EPBL_BBL_EFFIC < 0 and EPBL_BBL_TIDAL_EFFIC < 0, so
                      ! bottom boundary layer mixing is not enabled.
   logical :: use_la_windsea
-  real :: c_m3s3_to_Wm2 ! conversion from m^3 s^-3  →  W m^-2
+ ! real :: c_m3s3_to_Wm2 ! conversion from m^3 s^-3  →  W m^-2
   character(len=32) :: gamma_str !for MOM-message string convert
   
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
@@ -4163,6 +4204,25 @@ subroutine energetic_PBL_init(Time, G, GV, US, param_file, diag, CS)
   call get_param(param_file, mdl, "EPBL_SHEAR_ENERGY_WARN_IF_NO_KS", CS%warn_if_no_kappa_shear, &
                  "Warn when energy coupling is enabled but KAPPA_SHEAR is off; fallback to default m*.", &
                  default=.true., do_not_log=(CS%mstar_scheme==Use_Fixed_MStar))
+  call get_param(param_file, mdl, "IS_KS_WEIGHT", CS%IS_KS_weight, &
+          "If true, apply weighted function on Kd_interface for smooth profile when shear energy shuts down", &
+                 default=.false.,&
+                 do_not_log=(CS%mstar_scheme==Use_Fixed_MStar .and. (.not. CS%use_shear_energy_coupling)))
+  call get_param(param_file, mdl, "W_RATIO", CS%W_ratio, &
+          "when apply weighted function on Kd_interface for smooth profile,top ratio of ML keeps unchange", &
+                 units="nondim",default=0.8,&
+                 do_not_log=(CS%mstar_scheme==Use_Fixed_MStar .and. (.not. CS%use_shear_energy_coupling)))
+!  call get_param(param_file, mdl, "EPBL_KS_REL_THR", CS%KS_rel_thr, &
+!   "Relative threshold (0-1) to define kappa-shear MLD Hml_KS from |w''b''_shear| at the surface for shear shutdown.", &
+!   units="nondim", default=0.2, &
+!   do_not_log = .not.(CS%shutdown_shear_in_ML .and. CS%use_shear_energy_coupling .and. kappa_shear_is_used(param_file)))
+!   CS%KS_rel_thr = max(0.0, min(CS%KS_rel_thr, 1.0))
+
+!  call get_param(param_file, mdl, "EPBL_KS_SHUTDOWN_USE_HBL", CS%KS_use_Hbl_for_shutdown, &
+!    "If true, use Hbl_est (theta-gradient MLD) instead of Hml_KS to shutdown kappa-shear in OSBL.", &
+!    default=.false., &
+!    do_not_log = .not.(CS%shutdown_shear_in_ML .and. CS%use_shear_energy_coupling .and. kappa_shear_is_used(param_file)))
+
   ! If m* is fixed (CONSTANT scheme), energy-based coupling must be ignored.
   if (CS%mstar_scheme == Use_Fixed_MStar) then
     if (CS%use_shear_energy_coupling) then
@@ -4626,21 +4686,20 @@ subroutine energetic_PBL_init(Time, G, GV, US, param_file, diag, CS)
         Time, 'Increase in mstar due to Langmuir Turbulence.', 'nondim')
   endif
   if (CS%use_shear_energy_coupling .and. kappa_shear_is_used(param_file)) then
-    c_m3s3_to_Wm2 = GV%H_to_kg_m2 * US%Z_to_m**2 * US%s_to_T**3
     CS%id_mstar_ePBL = register_diag_field('ocean_model','mstar_ePBL',diag%axesT1,Time, &
       'Baseline m* from ePBL (no Langmuir)', '1')
     CS%id_mstar_shear = register_diag_field('ocean_model','mstar_shear',diag%axesT1,Time, &
       'Shear-implied m* = E_shear / u*^3', '1')
     CS%id_OSBL_Me_KS = register_diag_field('ocean_model','OSBL_Me_KS',diag%axesT1,Time, &
       'OSBL entrainment PE conversion from kappa-shear (negative w''b'' integral)', 'W m-2', &
-      conversion=c_m3s3_to_Wm2)
+      conversion=US%RZ3_T3_to_W_m2)
     CS%id_OSBL_Conv_KS = register_diag_field('ocean_model','OSBL_Conv_KS',diag%axesT1,Time, &
       'OSBL convective buoyancy work from kappa-shear (positive w''b'' integral)', 'W m-2', &
-      conversion=c_m3s3_to_Wm2)
+      conversion=US%RZ3_T3_to_W_m2)
     CS%id_E_ePBL = register_diag_field('ocean_model','E_ePBL',diag%axesT1,Time, &
-      'Mechanical energy from ePBL baseline (m* u*^3)', 'W m-2', conversion=c_m3s3_to_Wm2)
+      'Mechanical energy from ePBL baseline (m* u*^3)', 'W m-2', conversion=US%RZ3_T3_to_W_m2)
     CS%id_E_shear = register_diag_field('ocean_model','E_shear',diag%axesT1,Time, &
-      'Mechanical energy implied by shear (-Me - n*Conv)', 'W m-2', conversion=c_m3s3_to_Wm2)
+      'Mechanical energy implied by shear (-Me - n*Conv)', 'W m-2', conversion=US%RZ3_T3_to_W_m2)
     CS%id_Hbl_est = register_diag_field('ocean_model','Hbl_est',diag%axesT1,Time, &
       'Mixed-layer depth estimate by max|dθ/dz|', 'm', conversion=US%Z_to_m)
     CS%id_used_shear_flag = register_diag_field('ocean_model','used_shear_flag',diag%axesT1,Time, &
